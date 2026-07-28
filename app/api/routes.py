@@ -1,7 +1,10 @@
+import asyncio
 import csv, io, json
-from datetime import datetime
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+from queue import Queue
 from pathlib import Path
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 from sqlalchemy import asc, desc, func, select
 from sqlalchemy.orm import Session
@@ -9,20 +12,14 @@ from app.api.schemas import AutomatedUpdate, BulkAutomatedAction, CloseTradeRequ
 from app.core.config import get_settings
 from app.db.database import get_db
 from app.db.models import AuditLog, AutomatedStrategy, Setting, Strategy, Trade, WatchItem
+from app.services.live_dashboard import dashboard_live_stream
 from app.services.trading import TradingService
 from accessToken.newtoken import generate_login_url, generate_and_store_token
+from app.services.market_data import probe_fyers_connection
+from app.services.market_data import DEFAULT_CORE_MARKETS, DEFAULT_MARKET_FALLBACKS
+from app.services.symbol_master import refresh_symbol_master_cache, search_symbols
 
 router=APIRouter(prefix='/api')
-CORE_MARKETS=['NIFTY','BANKNIFTY','SENSEX']
-MOCK_MARKET={
-'NIFTY':{'spot':24854.35,'future':24912.10,'atm':24850,'change':126.40,'pct':0.51,'open':24740.20,'prev_close':24727.95,'mood':'Bullish','rsi':61.4,'vwap':24792.6,'supertrend':'BUY','ma20':24688.2,'ma50':24495.4,'ma100':23918.3,'ma200':23182.5},
-'BANKNIFTY':{'spot':53642.10,'future':53718.65,'atm':53600,'change':-108.30,'pct':-0.20,'open':53730.10,'prev_close':53750.40,'mood':'Neutral','rsi':48.8,'vwap':53681.7,'supertrend':'SELL','ma20':53210.1,'ma50':52680.4,'ma100':51180.7,'ma200':49822.3},
-'SENSEX':{'spot':81284.90,'future':81372.55,'atm':81300,'change':382.15,'pct':0.47,'open':80940.20,'prev_close':80902.75,'mood':'Bullish','rsi':59.2,'vwap':81122.4,'supertrend':'BUY','ma20':80690.5,'ma50':79742.2,'ma100':78102.6,'ma200':75418.9},
-'RELIANCE':{'spot':3018.40,'change':34.25,'pct':1.15,'open':2992.0,'prev_close':2984.15,'mood':'Bullish'},
-'TCS':{'spot':4286.60,'change':-21.10,'pct':-0.49,'open':4315.0,'prev_close':4307.70,'mood':'Neutral'},
-'FINNIFTY':{'spot':24318.25,'change':68.30,'pct':0.28,'open':24272.0,'prev_close':24249.95,'mood':'Bullish'},
-'MIDCPNIFTY':{'spot':12844.80,'change':-18.40,'pct':-0.14,'open':12870.0,'prev_close':12863.20,'mood':'Neutral'},
-}
 
 def audit(db,action,entity,entity_id='',details=None):
     db.add(AuditLog(action=action,entity=entity,entity_id=str(entity_id),details_json=json.dumps(details or {},default=str)))
@@ -36,32 +33,46 @@ def health():
 
 @router.get('/dashboard')
 def dashboard(db:Session=Depends(get_db)):
+    now_utc = datetime.now(timezone.utc)
     pending=db.scalar(select(func.count()).select_from(Strategy).where(Strategy.status=='PENDING')) or 0
     opened=db.scalar(select(func.count()).select_from(Trade).where(Trade.status=='OPEN')) or 0
     realised=db.scalar(select(func.coalesce(func.sum(Trade.pnl),0)).where(Trade.status=='CLOSED')) or 0
     auto=db.scalars(select(AutomatedStrategy).order_by(AutomatedStrategy.key)).all()
     watches=db.scalars(select(WatchItem).where(WatchItem.enabled==True)).all()
-    symbols=[w.symbol for w in watches if not w.is_core]
+    market_data=dashboard_live_stream.get_market_data(core_symbols=DEFAULT_CORE_MARKETS,fallback_map=DEFAULT_MARKET_FALLBACKS,watch_items=[w for w in watches if not w.is_core])
     return {'mode':'PAPER','pending_strategies':pending,'open_trades':opened,'realised_pnl':round(float(realised),2),
-            'core_markets':[{'symbol':s,**MOCK_MARKET[s]} for s in CORE_MARKETS],
-            'watchlist':[{'symbol':s,**MOCK_MARKET.get(s,{'spot':0,'change':0,'pct':0,'open':0,'prev_close':0,'mood':'Neutral'})} for s in symbols],
-            'automated':[serialize_auto(a) for a in auto],'broker_connected':get_settings().fyers_token_path.exists()}
+            'core_markets':market_data['core_markets'],
+            'watchlist':market_data['watchlist'],
+            'market_data_source':market_data['source'],
+            'market_data_as_of':market_data['as_of'],
+            'market_data_checked_at_ist':market_data['checked_at_ist'],
+            'stream_state':dashboard_live_stream.current_state(),
+            'broker':market_data['broker'],
+            'server_time_utc': now_utc.isoformat(),
+            'server_time_ist': now_utc.astimezone(ZoneInfo('Asia/Kolkata')).isoformat(),
+            'automated':[serialize_auto(a) for a in auto],'broker_connected':market_data['broker']['connected']}
 
 @router.post('/watchlist/{symbol}')
 def add_watch(symbol:str,item_type:str='STOCK',db:Session=Depends(get_db)):
     symbol=symbol.upper().strip()
-    if symbol in CORE_MARKETS: raise HTTPException(409,'This is already a fixed core market')
+    if symbol in DEFAULT_CORE_MARKETS: raise HTTPException(409,'This is already a fixed core market')
     row=db.get(WatchItem,symbol)
     if row: row.enabled=True
     else: db.add(WatchItem(symbol=symbol,item_type=item_type.upper(),is_core=False))
-    audit(db,'ADD','WATCHLIST',symbol); db.commit(); return {'status':'ok'}
+    audit(db,'ADD','WATCHLIST',symbol); db.commit()
+    watches=db.scalars(select(WatchItem).where(WatchItem.enabled==True)).all()
+    dashboard_live_stream.refresh(core_symbols=DEFAULT_CORE_MARKETS,fallback_map=DEFAULT_MARKET_FALLBACKS,watch_items=[w for w in watches if not w.is_core],force=True)
+    return {'status':'ok'}
 
 @router.delete('/watchlist/{symbol}')
 def remove_watch(symbol:str,db:Session=Depends(get_db)):
     row=db.get(WatchItem,symbol.upper())
     if not row: raise HTTPException(404,'Watch item not found')
     if row.is_core: raise HTTPException(409,'Core markets cannot be removed')
-    db.delete(row); audit(db,'REMOVE','WATCHLIST',symbol); db.commit(); return {'status':'removed'}
+    db.delete(row); audit(db,'REMOVE','WATCHLIST',symbol); db.commit()
+    watches=db.scalars(select(WatchItem).where(WatchItem.enabled==True)).all()
+    dashboard_live_stream.refresh(core_symbols=DEFAULT_CORE_MARKETS,fallback_map=DEFAULT_MARKET_FALLBACKS,watch_items=[w for w in watches if not w.is_core],force=True)
+    return {'status':'removed'}
 
 @router.post('/strategies',response_model=StrategyOut,status_code=201)
 def create_strategy(p:StrategyCreate,db:Session=Depends(get_db)):
@@ -210,9 +221,38 @@ def token_exchange(p:TokenAuthCode):
     s=get_settings()
     try:path=generate_and_store_token(p.auth_code_or_url,client_id=s.fyers_client_id,secret_key=s.fyers_secret_key,redirect_uri=s.fyers_redirect_uri,token_path=s.fyers_token_path)
     except (ValueError,RuntimeError) as e:raise HTTPException(400,str(e))
+    dashboard_live_stream.restart()
     return {'status':'ok','message':'FYERS token generated and stored successfully.','path':path.name}
 
 @router.get('/broker/token/status')
 def token_status():
-    p=get_settings().fyers_token_path
-    return {'configured':p.exists() and p.stat().st_size>20,'updated_at':datetime.fromtimestamp(p.stat().st_mtime).isoformat() if p.exists() else None}
+    return probe_fyers_connection()
+
+
+@router.get('/symbols/search')
+def symbol_search(q: str = "", limit: int = 20):
+    return {'items': search_symbols(q, limit=limit)}
+
+
+@router.post('/symbols/refresh')
+def symbol_refresh():
+    return refresh_symbol_master_cache(force=False)
+
+
+@router.websocket('/live')
+async def live_dashboard_socket(websocket: WebSocket):
+    await websocket.accept()
+    client_queue: Queue = Queue(maxsize=4)
+    dashboard_live_stream.subscribe_client(client_queue)
+    try:
+        while True:
+            try:
+                message = await asyncio.wait_for(asyncio.to_thread(client_queue.get), timeout=30)
+            except asyncio.TimeoutError:
+                await websocket.send_json({'type': 'heartbeat', 'ts': datetime.utcnow().isoformat()})
+                continue
+            await websocket.send_json(message)
+    except (WebSocketDisconnect, asyncio.CancelledError):
+        pass
+    finally:
+        dashboard_live_stream.unsubscribe_client(client_queue)

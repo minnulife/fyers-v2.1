@@ -8,6 +8,7 @@ from app.api.routes import router
 from app.api.auth_routes import router as auth_router
 from app.core.config import get_settings
 from app.db.init_db import init_db
+from app.services.live_dashboard import dashboard_live_stream
 
 settings = get_settings()
 BASE_DIR = Path(__file__).resolve().parent
@@ -16,7 +17,10 @@ STATIC_DIR = BASE_DIR / 'static'
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    dashboard_live_stream.start()
+    dashboard_live_stream.refresh_from_db(force=True)
     yield
+    dashboard_live_stream.stop()
 
 
 app = FastAPI(title=settings.app_name, version='2.1.0', lifespan=lifespan)

@@ -13,6 +13,7 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 import html
 import json
+import re
 
 
 
@@ -41,6 +42,17 @@ def extract_auth_code(value: str) -> str:
             raise ValueError("No auth_code was found. Paste the complete redirect URL or only the auth_code value.")
         return unquote(code).strip()
     return unquote(raw)
+
+
+_JWT_RE = re.compile(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$")
+
+
+def looks_like_access_token(value: str) -> bool:
+    """Heuristically detect a raw FYERS JWT access token."""
+    raw = html.unescape(value).strip().strip('"\'')
+    if not raw or "://" in raw or "?" in raw or "=" in raw:
+        return False
+    return bool(_JWT_RE.fullmatch(raw))
 
 
 def build_session(*, client_id: str, secret_key: str, redirect_uri: str) -> Any:
@@ -109,7 +121,8 @@ def save_access_token(token: str, token_path: Path) -> Path:
     fd, temporary = tempfile.mkstemp(prefix=".fyers-token-", dir=destination.parent, text=True)
     try:
         try:
-            os.fchmod(fd, 0o600)
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, 0o600)
         except OSError:
             pass
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -138,10 +151,14 @@ def generate_and_store_token(
     redirect_uri: str,
     token_path: Path,
 ) -> Path:
-    token = exchange_auth_code(
-        auth_code_or_url,
-        client_id=client_id,
-        secret_key=secret_key,
-        redirect_uri=redirect_uri,
-    )
+    raw = html.unescape(auth_code_or_url).strip().strip('"\'')
+    if looks_like_access_token(raw):
+        token = raw
+    else:
+        token = exchange_auth_code(
+            raw,
+            client_id=client_id,
+            secret_key=secret_key,
+            redirect_uri=redirect_uri,
+        )
     return save_access_token(token, token_path)

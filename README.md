@@ -48,7 +48,7 @@ The client ID, secret key and redirect URI are never returned by the browser API
 
 ## Token update
 
-Dashboard -> Update Token -> Generate Login URL -> complete FYERS login -> paste the returned auth code or complete redirect URL -> Generate and Store Token.
+Dashboard -> Update Token -> Generate Login URL -> complete FYERS login -> paste the returned auth code, the complete redirect URL, or an existing FYERS access token -> Generate and Store Token.
 
 Auth codes are short-lived and normally single-use. Generate a fresh login URL for each attempt.
 
